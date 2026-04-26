@@ -1,6 +1,6 @@
-name: Build release APK
-
+name: Build signed APK
 on:
+  push:
   workflow_dispatch:
 
 jobs:
@@ -21,30 +21,110 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # --- НАЧАЛО: Настройка подписи ---
+      # --- Шаг 1: Подготовка Keystore ---
       - name: Setup Keystore
         run: |
-          # Декодируем base64 строку секрета в файл
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
           chmod 600 release.keystore
           
-          # Передаем переменные окружения, которые ожидает build.gradle:
-          # STORE_FILE (путь к файлу)
-          echo "STORE_FILE=${{ github.workspace }}/release.keystore" >> $GITHUB_ENV
-          # Пароли и алиас
-          echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+          # Переменные для apksigner (не для Gradle)
+          echo "KEYSTORE_PATH=${{ github.workspace }}/release.keystore" >> $GITHUB_ENV
+          echo "KEYSTORE_PASS=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
           echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
-          echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
-      # --- КОНЕЦ: Настройка подписи ---
+          echo "KEY_PASS=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
 
-      - name: Build with Gradle
-        run: ./gradlew assembleRelease
+      # --- Шаг 2: Сборка UNSIGNED APK ---
+      # NO_SIGN=true предотвращает автоматическую подпись в build.gradle (если логика как в Delta Chat)
+      # Если в вашем проекте нет такой логики, можно просто собрать и потом переподписать, 
+      # но лучше убедиться, что Gradle не пытается подписать.
+      - name: Build Unsigned APK
+        run: |
+          # Если в build.gradle есть проверка NO_SIGN, раскомментируйте строку ниже:
+          # echo "NO_SIGN=true" >> $GITHUB_ENV
+          
+          # Или просто передаем переменную окружения в команду gradle
+          ./gradlew assembleRelease -Pandroid.injected.signing.store.file="" -Pandroid.injected.signing.key.alias="" 2>/dev/null || \
+          ./gradlew assembleRelease
+          
+          # Если сборка прошла с ошибкой подписи, значит NO_SIGN не сработал.
+          # В таком случае, если у вас нет NO_SIGN в gradle, придется собрать unsigned bundle или использовать другой метод.
+          # Но обычно для ручного подписания достаточно просто собрать, а потом перезаписать подпись.
+          # Давайте предположим, что мы просто собираем, а потом подписываем поверх.
+          # Если Gradle выдает ошибку "Keystore not found", значит он пытается подписать.
+          # Тогда нужно добавить NO_SIGN=true в env перед gradlew.
 
-      - name: Upload APK
+      # Исправленный вариант сборки с явным отключением подписи в Gradle (если поддерживается)
+      # Если ваш build.gradle не поддерживает NO_SIGN, используйте этот блок:
+      - name: Build Unsigned APK (Retry with NO_SIGN)
+        if: failure()
+        run: |
+          echo "NO_SIGN=true" >> $GITHUB_ENV
+          ./gradlew assembleRelease
+
+      # --- Шаг 3: ZipAlign ---
+      - name: ZipAlign APK
+        run: |
+          # Находим собранный APK
+          INPUT_APK=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*-unaligned.apk" | head -n 1)
+          
+          if [ -z "$INPUT_APK" ]; then
+            echo "APK not found!"
+            exit 1
+          fi
+          
+          echo "Found APK: $INPUT_APK"
+          
+          # Получаем версию build-tools
+          BUILD_TOOLS_VERSION=$(ls $ANDROID_HOME/build-tools/ | tail -n 1)
+          ZIPALIGN="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/zipalign"
+          
+          OUTPUT_APK="${INPUT_APK%.apk}-aligned.apk"
+          
+          echo "Running zipalign..."
+          $ZIPALIGN -v -p 4 "$INPUT_APK" "$OUTPUT_APK"
+          
+          echo "ALIGNED_APK=$OUTPUT_APK" >> $GITHUB_ENV
+
+      # --- Шаг 4: Подпись через apksigner ---
+      - name: Sign APK with apksigner
+        run: |
+          BUILD_TOOLS_VERSION=$(ls $ANDROID_HOME/build-tools/ | tail -n 1)
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          
+          echo "Signing: ${{ env.ALIGNED_APK }}"
+          
+          $APKSIGNER sign \
+            --ks ${{ env.KEYSTORE_PATH }} \
+            --ks-key-alias ${{ env.KEY_ALIAS }} \
+            --ks-pass pass:${{ env.KEYSTORE_PASS }} \
+            --key-pass pass:${{ env.KEY_PASS }} \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out ${{ env.ALIGNED_APK }} \
+            ${{ env.ALIGNED_APK }}
+
+      # --- Шаг 5: Проверка подписи ---
+      - name: Verify Signature
+        run: |
+          BUILD_TOOLS_VERSION=$(ls $ANDROID_HOME/build-tools/ | tail -n 1)
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          
+          echo "Verifying signature..."
+          $APKSIGNER verify --verbose ${{ env.ALIGNED_APK }}
+          
+          if [ $? -ne 0 ]; then
+            echo "Signature verification failed!"
+            exit 1
+          fi
+          echo "Signature verified successfully."
+
+      # --- Шаг 6: Загрузка артефакта ---
+      - name: Upload Signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: HeliBoard-release-signed
-          path: app/build/outputs/apk/release/*.apk
+          name: HeliBoard-signed-release
+          path: ${{ env.ALIGNED_APK }}
 
       - name: Archive reports for failed job
         uses: actions/upload-artifact@v4

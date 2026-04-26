@@ -1,0 +1,54 @@
+name: Build release APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # --- НАЧАЛО: Настройка подписи ---
+      - name: Setup Keystore
+        run: |
+          # Декодируем base64 строку секрета в файл
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+          chmod 600 release.keystore
+          
+          # Передаем переменные окружения, которые ожидает build.gradle:
+          # STORE_FILE (путь к файлу)
+          echo "STORE_FILE=${{ github.workspace }}/release.keystore" >> $GITHUB_ENV
+          # Пароли и алиас
+          echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+          echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+      # --- КОНЕЦ: Настройка подписи ---
+
+      - name: Build with Gradle
+        run: ./gradlew assembleRelease
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HeliBoard-release-signed
+          path: app/build/outputs/apk/release/*.apk
+
+      - name: Archive reports for failed job
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: '*/build/reports'
+        if: ${{ failure() }}
